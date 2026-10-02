@@ -392,6 +392,71 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status,available_at,id);
+
+CREATE TABLE IF NOT EXISTS archive_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_code TEXT NOT NULL UNIQUE,
+    series_key TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK(version >= 1),
+    scope_start_id INTEGER NOT NULL,
+    scope_end_id INTEGER NOT NULL,
+    cutoff_event_id INTEGER NOT NULL,
+    policy_code TEXT NOT NULL,
+    policy_params_hash TEXT NOT NULL,
+    chunk_size INTEGER NOT NULL CHECK(chunk_size > 0),
+    status TEXT NOT NULL DEFAULT 'frozen'
+        CHECK(status IN ('frozen','generating','completed','failed')),
+    anchor_ids_json TEXT NOT NULL,
+    anchor_count INTEGER NOT NULL,
+    freeze_max_event_id INTEGER NOT NULL,
+    manifest_hash TEXT,
+    envelope_secret_hex TEXT NOT NULL,
+    confirmed_chunks INTEGER NOT NULL DEFAULT 0,
+    confirmed_events INTEGER NOT NULL DEFAULT 0,
+    first_event_digest TEXT,
+    last_event_digest TEXT,
+    locked_at TEXT,
+    locked_by TEXT,
+    failure_reason TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    frozen_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(series_key,version)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_series ON archive_snapshots(series_key,version);
+CREATE INDEX IF NOT EXISTS idx_archive_status ON archive_snapshots(status);
+CREATE TABLE IF NOT EXISTS archive_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL REFERENCES archive_snapshots(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL,
+    start_event_id INTEGER NOT NULL,
+    end_event_id INTEGER NOT NULL,
+    event_count INTEGER NOT NULL,
+    first_event_digest TEXT,
+    last_event_digest TEXT,
+    prev_chunk_digest TEXT NOT NULL,
+    chunk_digest TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','confirmed','failed')),
+    failure_reason TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(snapshot_id,seq)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_chunks_seq ON archive_chunks(snapshot_id,seq);
+CREATE TABLE IF NOT EXISTS archive_chunk_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chunk_id INTEGER NOT NULL REFERENCES archive_chunks(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    audit_event_id INTEGER NOT NULL,
+    event_digest TEXT NOT NULL,
+    redacted_json TEXT NOT NULL,
+    is_restricted INTEGER NOT NULL DEFAULT 0 CHECK(is_restricted IN (0,1)),
+    UNIQUE(chunk_id,position)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_events_event ON archive_chunk_events(audit_event_id);
 '''
 
 PERMISSIONS = [
@@ -402,6 +467,11 @@ PERMISSIONS = [
     ("departments.read", "查看部门", "departments", "read"),
     ("departments.write", "维护部门", "departments", "write"),
     ("audit.read", "查看审计", "audit", "read"),
+    ("audit.archive.freeze", "冻结归档快照", "audit_archive", "freeze"),
+    ("audit.archive.generate", "生成归档快照", "audit_archive", "generate"),
+    ("audit.archive.read", "查看归档快照", "audit_archive", "read"),
+    ("audit.archive.verify", "校验归档完整性", "audit_archive", "verify"),
+    ("audit.archive.review", "复核归档原值", "audit_archive", "review"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
     ("forensic_cases.read", "查看鉴定材料", "forensic_cases", "read"),
     ("forensic_cases.write", "维护鉴定材料", "forensic_cases", "write"),
@@ -498,7 +568,8 @@ def init_db() -> None:
             "registrar": ["forensic_cases.read", "forensic_cases.write", "custody.read", "custody.write"],
             "technician": ["forensic_cases.read", "custody.read", "examination.read", "examination.write"],
             "curator": ["forensic_cases.read", "custody.read", "examination.read", "quality.review", "release.approve"],
-            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read"],
+            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read",
+                        "audit.archive.read", "audit.archive.verify"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]
