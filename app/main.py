@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.api import audit, auth, roles, system, users
+from app.archives.router import router as archive_router
 from app.core.errors import DomainError
 from app.database import close_connection, init_db
 from app.forensics.router import router as forensics_router
@@ -35,6 +36,7 @@ app.include_router(auth.router)
 app.include_router(users.router)
 app.include_router(roles.router)
 app.include_router(audit.router)
+app.include_router(archive_router)
 app.include_router(system.router)
 app.include_router(forensics_router)
 

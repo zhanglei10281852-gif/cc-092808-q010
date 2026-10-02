@@ -392,6 +392,66 @@ CREATE TABLE IF NOT EXISTS outbox_events (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox_events(status,available_at,id);
+
+CREATE TABLE IF NOT EXISTS app_secrets (
+    name TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_archive_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_code TEXT NOT NULL UNIQUE,
+    scope_json TEXT NOT NULL,
+    policy_json TEXT NOT NULL,
+    fingerprint TEXT NOT NULL UNIQUE,
+    chunk_size INTEGER NOT NULL CHECK(chunk_size BETWEEN 1 AND 5000),
+    start_event_id INTEGER NOT NULL,
+    end_event_id INTEGER NOT NULL,
+    expected_event_count INTEGER NOT NULL,
+    total_events INTEGER NOT NULL DEFAULT 0,
+    total_chunks INTEGER NOT NULL DEFAULT 0,
+    manifest_digest TEXT,
+    manifest_signature TEXT,
+    status TEXT NOT NULL DEFAULT 'frozen' CHECK(status IN ('frozen','generating','completed','failed')),
+    failure_reason TEXT,
+    created_by INTEGER REFERENCES users(id),
+    created_by_name TEXT NOT NULL,
+    frozen_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_archive_snapshots_status ON audit_archive_snapshots(status,id);
+CREATE TABLE IF NOT EXISTS audit_archive_chunks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL REFERENCES audit_archive_snapshots(id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL CHECK(seq >= 0),
+    start_event_id INTEGER NOT NULL,
+    end_event_id INTEGER NOT NULL,
+    event_count INTEGER NOT NULL CHECK(event_count > 0),
+    first_event_digest TEXT NOT NULL,
+    last_event_digest TEXT NOT NULL,
+    event_entry_digest TEXT NOT NULL,
+    chunk_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(snapshot_id,seq)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_chunks_seq ON audit_archive_chunks(snapshot_id,seq);
+CREATE TABLE IF NOT EXISTS audit_archive_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_id INTEGER NOT NULL REFERENCES audit_archive_snapshots(id) ON DELETE CASCADE,
+    event_id INTEGER NOT NULL,
+    chunk_seq INTEGER NOT NULL,
+    seq INTEGER NOT NULL,
+    canonical_json TEXT NOT NULL,
+    redacted_json TEXT NOT NULL,
+    event_digest TEXT NOT NULL,
+    entry_digest TEXT NOT NULL,
+    restricted_case INTEGER NOT NULL DEFAULT 0 CHECK(restricted_case IN (0,1)),
+    redaction_count INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(snapshot_id,event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_archive_events_event ON audit_archive_events(snapshot_id,event_id);
+CREATE INDEX IF NOT EXISTS idx_archive_events_chunk ON audit_archive_events(snapshot_id,chunk_seq,event_id);
 '''
 
 PERMISSIONS = [
@@ -402,6 +462,8 @@ PERMISSIONS = [
     ("departments.read", "查看部门", "departments", "read"),
     ("departments.write", "维护部门", "departments", "write"),
     ("audit.read", "查看审计", "audit", "read"),
+    ("audit.archive", "管理审计归档", "audit", "archive"),
+    ("audit.verify", "校验审计归档", "audit", "verify"),
     ("jobs.run", "执行后台任务", "jobs", "run"),
     ("forensic_cases.read", "查看鉴定材料", "forensic_cases", "read"),
     ("forensic_cases.write", "维护鉴定材料", "forensic_cases", "write"),
@@ -498,7 +560,7 @@ def init_db() -> None:
             "registrar": ["forensic_cases.read", "forensic_cases.write", "custody.read", "custody.write"],
             "technician": ["forensic_cases.read", "custody.read", "examination.read", "examination.write"],
             "curator": ["forensic_cases.read", "custody.read", "examination.read", "quality.review", "release.approve"],
-            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read"],
+            "auditor": ["forensic_cases.read", "custody.read", "examination.read", "audit.read", "audit.verify"],
         }
         for role_code, codes in role_permissions.items():
             role_id = connection.execute("SELECT id FROM roles WHERE code=?", (role_code,)).fetchone()[0]

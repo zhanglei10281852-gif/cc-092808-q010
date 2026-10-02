@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from app.archives.repository import ARCHIVE_SECRET_NAME
+from app.archives.service import ArchiveService
+from app.core.clock import to_storage, utc_now
+from app.core.errors import DomainError
 from app.database import database_path, get_connection, init_db, transaction
 from app.forensics.service import ForensicService
 
@@ -24,6 +29,7 @@ def check_command() -> dict:
     required = {
         "forensic_cases", "specimens", "storage_locations", "examinations",
         "review_schedules", "quality_alerts", "outbox_events",
+        "audit_archive_snapshots", "audit_archive_chunks", "audit_archive_events", "app_secrets",
     }
     actual = {
         row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
@@ -110,6 +116,79 @@ def export_command(path: str) -> dict:
     return {"path": str(target), "count": total}
 
 
+def _archive_service() -> ArchiveService:
+    init_db()
+    return ArchiveService(get_connection())
+
+
+def archive_freeze_command(args: argparse.Namespace) -> dict:
+    restricted_case_ids = (
+        [int(part) for part in args.restricted_case_ids.split(",") if part]
+        if args.restricted_case_ids
+        else None
+    )
+    snapshot = _archive_service().freeze(
+        created_by=None,
+        created_by_name="cli",
+        end_event_id=args.end_event_id,
+        redact_tokens=not args.no_redact_tokens,
+        redact_contacts=not args.no_redact_contacts,
+        redact_restricted_cases=not args.no_redact_restricted_cases,
+        restricted_case_ids=restricted_case_ids,
+        chunk_size=args.chunk_size,
+    )
+    return snapshot
+
+
+def archive_generate_command(args: argparse.Namespace) -> dict:
+    return _archive_service().generate(args.snapshot_id, max_chunks=args.max_chunks)
+
+
+def archive_list_command(args: argparse.Namespace) -> dict:
+    return _archive_service().list_snapshots(status=args.status, limit=args.limit, offset=args.offset)
+
+
+def archive_show_command(args: argparse.Namespace) -> dict:
+    service = _archive_service()
+    snapshot = service.get_snapshot(args.snapshot_id)
+    snapshot["chunks"] = service.list_chunks(args.snapshot_id)
+    return snapshot
+
+
+def archive_verify_command(args: argparse.Namespace) -> dict:
+    return _archive_service().verify(args.snapshot_id)
+
+
+def archive_export_command(args: argparse.Namespace) -> dict:
+    service = _archive_service()
+    bundle = service.export_bundle(args.snapshot_id, profile=args.profile)
+    target = Path(args.path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(bundle, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"path": str(target), "profile": args.profile, "events": len(bundle["events"]), "chunks": len(bundle["chunks"])}
+
+
+def archive_verify_file_command(args: argparse.Namespace) -> dict:
+    bundle = json.loads(Path(args.path).expanduser().resolve().read_text(encoding="utf-8"))
+    secret: str | None = None
+    if args.secret_env:
+        secret = os.environ.get(args.secret_env)
+    elif args.with_database_secret:
+        init_db()
+        secret = ArchiveService(get_connection()).repository.archive_secret(to_storage(utc_now()))
+    return ArchiveService.verify_bundle(bundle, secret=secret)
+
+
+def archive_secret_command(args: argparse.Namespace) -> dict:
+    del args
+    init_db()
+    secret = ArchiveService(get_connection()).repository.archive_secret(to_storage(utc_now()))
+    if os.getenv("FORENSICS_CLI_REVEAL_SECRET") != "1":
+        return {"name": ARCHIVE_SECRET_NAME, "hint": "确认在安全渠道后设置 FORENSICS_CLI_REVEAL_SECRET=1 再执行"}
+    return {"name": ARCHIVE_SECRET_NAME, "secret": secret}
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="司法鉴定机构运维命令")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -119,7 +198,58 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("demo", help="写入一组示范入库数据")
     export = subparsers.add_parser("export-forensic_cases", help="导出案件档案")
     export.add_argument("path")
+
+    archives = subparsers.add_parser("archive", help="审计归档快照管理")
+    archive_sub = archives.add_subparsers(dest="archive_command", required=True)
+
+    freeze = archive_sub.add_parser("freeze", help="按截止事件与脱敏策略冻结快照")
+    freeze.add_argument("end_event_id", type=int)
+    freeze.add_argument("--chunk-size", type=int, default=200)
+    freeze.add_argument("--restricted-case-ids", default="", help="逗号分隔的受限案件 ID，缺省取全部 restricted 案件")
+    freeze.add_argument("--no-redact-tokens", action="store_true")
+    freeze.add_argument("--no-redact-contacts", action="store_true")
+    freeze.add_argument("--no-redact-restricted-cases", action="store_true")
+
+    generate = archive_sub.add_parser("generate", help="生成或续跑分块清单")
+    generate.add_argument("snapshot_id", type=int)
+    generate.add_argument("--max-chunks", type=int, default=None)
+
+    listed = archive_sub.add_parser("list", help="查看归档快照进度")
+    listed.add_argument("--status", choices=["frozen", "generating", "completed", "failed"], default=None)
+    listed.add_argument("--limit", type=int, default=20)
+    listed.add_argument("--offset", type=int, default=0)
+
+    show = archive_sub.add_parser("show", help="查看快照覆盖区间、失败原因与分块")
+    show.add_argument("snapshot_id", type=int)
+
+    verify = archive_sub.add_parser("verify", help="对照线上事件独立校验快照完整性")
+    verify.add_argument("snapshot_id", type=int)
+
+    export_archive = archive_sub.add_parser("export", help="导出归档包")
+    export_archive.add_argument("snapshot_id", type=int)
+    export_archive.add_argument("path")
+    export_archive.add_argument("--profile", choices=["manifest", "redacted", "canonical"], default="redacted")
+
+    verify_file = archive_sub.add_parser("verify-file", help="离线校验导出的归档包")
+    verify_file.add_argument("path")
+    secret_group = verify_file.add_mutually_exclusive_group()
+    secret_group.add_argument("--secret-env", default="", help="封存密钥所在环境变量名")
+    secret_group.add_argument("--with-database-secret", action="store_true")
+
+    archive_sub.add_parser("secret", help="查看脱敏承诺封存密钥名称（默认不显示值）")
     return parser
+
+
+ARCHIVE_COMMANDS = {
+    "freeze": archive_freeze_command,
+    "generate": archive_generate_command,
+    "list": archive_list_command,
+    "show": archive_show_command,
+    "verify": archive_verify_command,
+    "export": archive_export_command,
+    "verify-file": archive_verify_file_command,
+    "secret": archive_secret_command,
+}
 
 
 def main() -> int:
@@ -133,10 +263,19 @@ def main() -> int:
             result = smoke_command()
         elif args.command == "demo":
             result = demo_command()
+        elif args.command == "archive":
+            result = ARCHIVE_COMMANDS[args.archive_command](args)
         else:
             result = export_command(args.path)
         print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.command == "archive" and args.archive_command == "verify" and not result["ok"]:
+            return 2
+        if args.command == "archive" and args.archive_command == "verify-file" and not result["ok"]:
+            return 2
         return 0
+    except DomainError as exc:
+        print(json.dumps({"error": str(exc), "code": exc.code, "context": exc.context}, ensure_ascii=False))
+        return 1
     except (sqlite3.Error, RuntimeError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}, ensure_ascii=False))
         return 1
